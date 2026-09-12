@@ -12,82 +12,54 @@ Each run keeps every stage so the retrieval process remains inspectable.
 
 ## Install
 
-### 1. Clone the repository into `~/scripts/qsearch`
+Two commands. Clone the repository into `~/scripts/qsearch`, then run its installer:
 
 ```bash
-mkdir -p ~/scripts
 git clone https://github.com/florianbuetow/qsearch-bash.git ~/scripts/qsearch
+~/scripts/qsearch/install.sh
 ```
 
-### 2. Make the scripts executable
+`install.sh` does the whole installation:
+
+1. makes `scripts/qsearch` executable
+2. installs the dependencies you are missing (macOS via Homebrew, Debian/Ubuntu-like
+   Linux via apt) — tools you already have are left untouched, so nothing you rely on
+   gets upgraded behind your back
+3. adds `~/scripts/qsearch/scripts` to your `PATH` in `~/.zshrc`, `~/.bashrc`,
+   `~/.bash_profile`, or `~/.config/fish/config.fish`, whichever matches your shell
+4. verifies every dependency and exits non-zero if a required one is missing
+
+Then open a new shell:
 
 ```bash
-chmod +x ~/scripts/qsearch/scripts/*
-```
-
-### 3. Add QSearch to your `PATH`
-
-Pick the section for the shell you use, run the command, then reload your shell.
-
-#### bash
-
-```bash
-echo 'export PATH="$HOME/scripts/qsearch/scripts:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-On macOS, bash reads `~/.bash_profile` for login shells — use that file instead if
-`~/.bashrc` is not sourced on your system.
-
-#### zsh
-
-```zsh
-echo 'export PATH="$HOME/scripts/qsearch/scripts:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-#### fish
-
-```fish
-fish_add_path "$HOME/scripts/qsearch/scripts"
-```
-
-Older fish versions without `fish_add_path`:
-
-```fish
-echo 'set -gx PATH $HOME/scripts/qsearch/scripts $PATH' >> ~/.config/fish/config.fish
-source ~/.config/fish/config.fish
-```
-
-### 4. Verify the installation
-
-```bash
-which qsearch
 qsearch --help
 ```
 
-`scripts/install.sh` is an optional convenience: it runs the `chmod` of step 2 and
-prints the `PATH` line to add.
-
-```bash
-~/scripts/qsearch/scripts/install.sh
-```
-
-> `qsearch` finds its stopword lists next to itself, so put the `scripts/` directory
+> `qsearch` finds its stopword lists next to itself, so keep the `scripts/` directory
 > on your `PATH` rather than symlinking the `qsearch` file somewhere else.
 
-## Install dependencies
+### Dependencies
 
-macOS:
+| Tool | Required | Used for |
+| ---- | -------- | -------- |
+| `rg` (ripgrep) | yes | lexical search |
+| `rga` (ripgrep-all) | yes | lexical search inside rich documents |
+| `stemwords` (Snowball) | yes | the default `--linguistics snowball` expansion |
+| `pandoc` | no | DOCX/ODT/EPUB/FB2/IPYNB/HTML text extraction |
+| `pdftotext` (poppler) | no | PDF text extraction |
+| `clawgrep` | no | the semantic fallback stage |
+| `las` | no | optional `--linguistics las` lemmatization |
+
+Homebrew's `snowball` formula ships `libstemmer` and the `stemwords` example source
+but no `stemwords` binary, so `install-macos-deps.sh` compiles it into
+`scripts/stemwords`. That needs a C compiler — run `xcode-select --install` if the
+build step reports one is missing.
+
+The dependency installers can also be run on their own:
 
 ```bash
-~/scripts/qsearch/scripts/install-macos-deps.sh
-```
-
-On Debian/Ubuntu-like Linux:
-
-```bash
-~/scripts/qsearch/scripts/install-linux-deps.sh
+~/scripts/qsearch/install-macos-deps.sh
+~/scripts/qsearch/install-linux-deps.sh
 ```
 
 ## Update
@@ -95,7 +67,7 @@ On Debian/Ubuntu-like Linux:
 ```bash
 cd ~/scripts/qsearch
 git pull
-chmod +x scripts/*
+./install.sh
 ```
 
 ## Uninstall
@@ -203,14 +175,17 @@ The lexical stages support German through German stopwords and Snowball stemming
 qsearch-bash/
 ├── LICENSE
 ├── README.md
-└── scripts/
+├── install.sh                  the installer you run after cloning
+├── install-macos-deps.sh       Homebrew dependencies
+├── install-linux-deps.sh       apt/cargo dependencies
+└── scripts/                    the directory that goes on your PATH
     ├── qsearch                 the search command
-    ├── install.sh              chmod helper + PATH hint
-    ├── install-macos-deps.sh   Homebrew dependencies
-    ├── install-linux-deps.sh   apt/cargo dependencies
     ├── stopwords-de.txt
     └── stopwords-en.txt
 ```
+
+The installers live at the repository root, not in `scripts/`, so that putting
+`scripts/` on your `PATH` does not also put three `install*.sh` commands on it.
 
 ## License
 

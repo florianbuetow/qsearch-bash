@@ -1,3 +1,9 @@
+# --- Project-specific ---
+
+# stemwords binary built by install-macos-deps.sh
+scripts/stemwords
+scripts/.stemwords-build.log
+
 # --- macOS ---
 
 # Finder metadata
