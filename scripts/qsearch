@@ -1,0 +1,617 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+DEFAULT_TYPES="txt,md,markdown,rst,org,adoc,asciidoc,tex,log,csv,tsv,json,jsonl,yaml,yml,toml,xml,html,htm,ini,cfg,conf,properties,sql,sh,bash,zsh,fish,py,js,jsx,ts,tsx,java,c,cc,cpp,cxx,h,hpp,rs,go,swift,kt,kts,scala,clj,cljs,edn,rb,php,pl,pm,lua,css,scss,sass,less,vue,svelte,pdf,docx,odt,epub,fb2,ipynb"
+RICH_TYPES="pdf,docx,odt,epub,fb2,ipynb,html,htm"
+
+case "$(uname -s)" in
+  Darwin) DEFAULT_CACHE="$HOME/Library/Caches/qsearch" ;;
+  *) DEFAULT_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/qsearch" ;;
+esac
+
+TYPES="$DEFAULT_TYPES"
+LANGUAGE="auto"
+LINGUISTICS="snowball"
+SEMANTIC_MODE="auto"
+THRESHOLD="0.75"
+TOP_K="20"
+CACHE_DIR="$DEFAULT_CACHE"
+QUERY=""
+PATHS=()
+SEARCH_PATHS=()
+GLOB_ARGS=()
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  qsearch [options] "query" PATH [PATH ...]
+
+Options:
+  --types EXT,EXT,...       File extensions to search.
+                            Default: common text/code + PDF/DOCX/ODT/EPUB/IPYNB.
+  --lang auto|en|de        Query language. Default: auto.
+  --linguistics MODE       snowball|las|none. Default: snowball.
+  --semantic MODE          auto|always|never. Default: auto.
+  --threshold FLOAT        Lexical confidence needed to skip semantic search.
+                            Default: 0.75.
+  --top N                  Semantic/final top results. Default: 20.
+  --cache-dir PATH         Cache/run location.
+  -h, --help               Show this help.
+
+Examples:
+  qsearch "how are autonomous agents evaluated?" ~/Documents /Volumes/Archive
+  qsearch --types md,txt,pdf,docx "agent evaluation" ~/Documents
+  qsearch --lang de "Bewertung autonomer Agenten" ~/Documents
+  qsearch --semantic always "failure handling" .
+USAGE
+}
+
+warn() { printf 'qsearch: %s\n' "$*" >&2; }
+die() { warn "$*"; exit 2; }
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+canonical_path() {
+  local p="$1"
+  if [ -d "$p" ]; then
+    (CDPATH= cd -- "$p" 2>/dev/null && pwd -P)
+  elif [ -e "$p" ]; then
+    local d b
+    d="$(dirname -- "$p")"
+    b="$(basename -- "$p")"
+    (CDPATH= cd -- "$d" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$b")
+  else
+    return 1
+  fi
+}
+
+stat_signature() {
+  local p="$1"
+  if stat -f '%m:%z' "$p" >/dev/null 2>&1; then
+    stat -f '%m:%z' "$p"
+  else
+    stat -c '%Y:%s' "$p"
+  fi
+}
+
+is_selected_type() {
+  local file="$1" base ext
+  base="$(basename -- "$file")"
+  case "$base" in
+    *.*) ext="${base##*.}" ;;
+    *) return 1 ;;
+  esac
+  ext="$(lower "$ext")"
+  case ",${TYPES}," in
+    *",${ext},"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_rich_type() {
+  local file="$1" base ext
+  base="$(basename -- "$file")"
+  ext="$(lower "${base##*.}")"
+  case ",${RICH_TYPES}," in
+    *",${ext},"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+escape_regex() {
+  printf '%s' "$1" | sed 's/[][(){}.^$*+?|\\]/\\&/g'
+}
+
+tokenize() {
+  tr '[:upper:]' '[:lower:]' \
+    | tr -cs '[:alnum:]_-' '\n' \
+    | awk 'length($0) >= 2'
+}
+
+detect_language_fast() {
+  local q="$1" de en
+  de="$(printf '%s\n' "$q" | tr '[:upper:]' '[:lower:]' | grep -Eio '(^|[^[:alnum:]_])(der|die|das|und|ist|sind|nicht|mit|für|von|zu|wie|was|ich|wir|ein|eine|einer|einen|einem|eines|auf|bei|durch|werden|wurde|wurden|über)([^[:alnum:]_]|$)|[äöüß]' 2>/dev/null | wc -l | tr -d ' ')"
+  en="$(printf '%s\n' "$q" | tr '[:upper:]' '[:lower:]' | grep -Eio '(^|[^[:alnum:]_])(the|and|is|are|not|with|for|from|to|how|what|this|that|of|in|on|by|was|were|be|been|does|do)([^[:alnum:]_]|$)' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${de:-0}" -gt "${en:-0}" ]; then printf 'de\n'; else printf 'en\n'; fi
+}
+
+detect_language_las() {
+  local q="$1" out
+  out="$(printf '%s\n' "$q" | las identify 2>/dev/null || true)"
+  printf '%s\n' "$out" | sed -nE 's/.*"locale"[[:space:]]*:[[:space:]]*"([^\"]+)".*/\1/p' | head -n 1
+}
+
+stopword_file() {
+  case "$1" in
+    de) printf '%s/stopwords-de.txt\n' "$SCRIPT_DIR" ;;
+    *) printf '%s/stopwords-en.txt\n' "$SCRIPT_DIR" ;;
+  esac
+}
+
+filter_stopwords() {
+  local input="$1" output="$2" sw
+  sw="$(stopword_file "$LANGUAGE")"
+  if [ -f "$sw" ]; then
+    grep -Fivx -f "$sw" "$input" 2>/dev/null | awk 'NF' > "$output" || true
+  else
+    cp "$input" "$output"
+  fi
+  if [ ! -s "$output" ]; then
+    cp "$input" "$output"
+  fi
+}
+
+prepare_query() {
+  local raw="$RUN_DIR/query-tokens.raw.txt"
+  local filtered="$RUN_DIR/query-tokens.txt"
+  local lemmas="$RUN_DIR/query-lemmas.txt"
+  local stems="$RUN_DIR/query-stems.txt"
+  local regexes="$RUN_DIR/query-regexes.tsv"
+
+  printf '%s\n' "$QUERY" | tokenize > "$raw"
+  filter_stopwords "$raw" "$filtered"
+
+  if [ "$LINGUISTICS" = "las" ]; then
+    command_exists las || die "--linguistics las requested, but 'las' is not installed"
+    las lemmatize --locale "$LANGUAGE" --process-by line < "$filtered" 2>"$RUN_DIR/las.err" \
+      | tokenize > "$lemmas" || true
+    if [ "$(wc -l < "$lemmas" | tr -d ' ')" != "$(wc -l < "$filtered" | tr -d ' ')" ]; then
+      warn "LAS output did not align one-to-one with query tokens; using original tokens for expansion"
+      cp "$filtered" "$lemmas"
+    fi
+  else
+    cp "$filtered" "$lemmas"
+  fi
+
+  if [ "$LINGUISTICS" != "none" ] && command_exists stemwords; then
+    stemwords -l "$LANGUAGE" < "$lemmas" > "$stems" 2>"$RUN_DIR/snowball.err" || cp "$lemmas" "$stems"
+  else
+    if [ "$LINGUISTICS" = "snowball" ] && ! command_exists stemwords; then
+      warn "'stemwords' is not installed; continuing without stemming"
+    fi
+    cp "$lemmas" "$stems"
+  fi
+
+  : > "$regexes"
+  exec 3<"$filtered"
+  exec 4<"$lemmas"
+  exec 5<"$stems"
+  local original lemma stem eo el es pattern
+  while IFS= read -r original <&3; do
+    IFS= read -r lemma <&4 || lemma="$original"
+    IFS= read -r stem <&5 || stem="$lemma"
+    eo="$(escape_regex "$original")"
+    el="$(escape_regex "$lemma")"
+    es="$(escape_regex "$stem")"
+    if [ "${#stem}" -ge 4 ] && [ "$LINGUISTICS" != "none" ]; then
+      pattern="\\b(?:${eo}|${el}|${es}\\p{L}*)\\b"
+    else
+      pattern="\\b(?:${eo}|${el})\\b"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$original" "$lemma" "$stem" "$pattern" >> "$regexes"
+  done
+  exec 3<&-
+  exec 4<&-
+  exec 5<&-
+
+  CONCEPT_COUNT="$(wc -l < "$regexes" | tr -d ' ')"
+  [ "$CONCEPT_COUNT" -gt 0 ] || die "query contains no searchable terms"
+
+  {
+    printf 'query\t%s\n' "$QUERY"
+    printf 'language\t%s\n' "$LANGUAGE"
+    printf 'linguistics\t%s\n' "$LINGUISTICS"
+    printf 'concepts\t%s\n' "$CONCEPT_COUNT"
+    printf '\noriginal\tlemma\tstem\tregex\n'
+    cat "$regexes"
+  } > "$RUN_DIR/00-query.txt"
+}
+
+build_globs() {
+  local oldifs ext
+  oldifs="$IFS"
+  IFS=','
+  for ext in $TYPES; do
+    [ -n "$ext" ] || continue
+    GLOB_ARGS+=("-g" "*.${ext}")
+  done
+  IFS="$oldifs"
+}
+
+run_rga() {
+  rga --glob-case-insensitive "$@"
+}
+
+run_exact_stage() {
+  : > "$RUN_DIR/01-exact.txt"
+  : > "$RUN_DIR/01-exact-files.txt"
+  run_rga -n --no-heading --color never -i -F "${GLOB_ARGS[@]}" -e "$QUERY" "${SEARCH_PATHS[@]}" \
+    > "$RUN_DIR/01-exact.txt" 2> "$RUN_DIR/01-exact.err" || true
+  run_rga -l --color never -i -F "${GLOB_ARGS[@]}" -e "$QUERY" "${SEARCH_PATHS[@]}" \
+    > "$RUN_DIR/01-exact-files.txt" 2>> "$RUN_DIR/01-exact.err" || true
+}
+
+run_expanded_stage() {
+  local combined="" pattern idx=0 safe_name
+  : > "$RUN_DIR/02-expanded.txt"
+  : > "$RUN_DIR/02-concept-files.tsv"
+  mkdir -p "$RUN_DIR/02-concepts"
+
+  while IFS=$'\t' read -r original lemma stem pattern; do
+    idx=$((idx + 1))
+    if [ -z "$combined" ]; then combined="$pattern"; else combined="${combined}|${pattern}"; fi
+
+    safe_name="$(printf '%03d-%s' "$idx" "$original" | tr '/[:space:]' '__')"
+    run_rga -l --color never -i "${GLOB_ARGS[@]}" -e "$pattern" "${SEARCH_PATHS[@]}" \
+      > "$RUN_DIR/02-concepts/${safe_name}.files.txt" 2>> "$RUN_DIR/02-expanded.err" || true
+
+    while IFS= read -r file; do
+      [ -n "$file" ] && printf 'C\t%s\t%s\n' "$idx" "$file" >> "$RUN_DIR/02-concept-files.tsv"
+    done < "$RUN_DIR/02-concepts/${safe_name}.files.txt"
+  done < "$RUN_DIR/query-regexes.tsv"
+
+  run_rga -n --no-heading --color never -i "${GLOB_ARGS[@]}" -e "$combined" "${SEARCH_PATHS[@]}" \
+    > "$RUN_DIR/02-expanded.txt" 2>> "$RUN_DIR/02-expanded.err" || true
+}
+
+build_lexical_ranking() {
+  local stream="$RUN_DIR/lexical-events.tsv"
+  : > "$stream"
+  while IFS= read -r f; do
+    [ -n "$f" ] && printf 'E\t%s\n' "$f" >> "$stream"
+  done < "$RUN_DIR/01-exact-files.txt"
+  cat "$RUN_DIR/02-concept-files.tsv" >> "$stream"
+
+  awk -F '\t' -v OFS='\t' -v total="$CONCEPT_COUNT" '
+    $1 == "E" {
+      exact[$2] = 1
+      files[$2] = 1
+      next
+    }
+    $1 == "C" {
+      key = $2 SUBSEP $3
+      if (!seen[key]++) count[$3]++
+      files[$3] = 1
+    }
+    END {
+      for (f in files) {
+        c = count[f] + 0
+        coverage = total > 0 ? c / total : 0
+        e = exact[f] ? 1 : 0
+        score = coverage + (e ? 0.25 : 0)
+        if (score > 1) score = 1
+        printf "%s\t%d\t%d\t%.6f\t%d\t%.6f\n", f, c, total, coverage, e, score
+      }
+    }
+  ' "$stream" | sort -t "$(printf '\t')" -k6,6nr -k4,4nr > "$RUN_DIR/lexical-ranking.tsv"
+
+  LEXICAL_CONFIDENCE="$(awk -F '\t' 'NR==1 {print $6; exit}' "$RUN_DIR/lexical-ranking.tsv")"
+  [ -n "$LEXICAL_CONFIDENCE" ] || LEXICAL_CONFIDENCE="0"
+  if [ "$CONCEPT_COUNT" -eq 1 ] && [ "$LEXICAL_CONFIDENCE" != "0" ]; then
+    if [ ! -s "$RUN_DIR/01-exact-files.txt" ]; then
+      LEXICAL_CONFIDENCE="0.50"
+    fi
+  fi
+}
+
+should_run_semantic() {
+  case "$SEMANTIC_MODE" in
+    always) return 0 ;;
+    never) return 1 ;;
+    auto)
+      awk -v a="$LEXICAL_CONFIDENCE" -v b="$THRESHOLD" 'BEGIN { exit !(a < b) }'
+      ;;
+    *) die "invalid --semantic mode: $SEMANTIC_MODE" ;;
+  esac
+}
+
+extract_rich() {
+  local src="$1" dst meta sig old tmp ext
+  dst="$EXTRACT_ROOT/${src#/}.txt"
+  meta="${dst}.meta"
+  mkdir -p "$(dirname -- "$dst")"
+  sig="$(stat_signature "$src" 2>/dev/null || printf 'unknown')"
+  old=""
+  [ -f "$meta" ] && old="$(cat "$meta" 2>/dev/null || true)"
+  if [ -s "$dst" ] && [ "$sig" = "$old" ]; then
+    printf '%s\n' "$dst"
+    return 0
+  fi
+
+  tmp="${dst}.tmp.$$"
+  rm -f "$tmp"
+  ext="$(lower "${src##*.}")"
+  case "$ext" in
+    pdf)
+      if ! command_exists pdftotext; then
+        warn "pdftotext missing; semantic search will skip $src"
+        return 1
+      fi
+      pdftotext "$src" "$tmp" >/dev/null 2>>"$RUN_DIR/extraction.err" || { rm -f "$tmp"; return 1; }
+      ;;
+    docx|odt|epub|fb2|ipynb|html|htm)
+      if ! command_exists pandoc; then
+        warn "pandoc missing; semantic search will skip $src"
+        return 1
+      fi
+      pandoc "$src" -t plain --wrap=none -o "$tmp" 2>>"$RUN_DIR/extraction.err" || { rm -f "$tmp"; return 1; }
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  mv "$tmp" "$dst"
+  printf '%s\n' "$sig" > "$meta"
+  printf '%s\n' "$dst"
+}
+
+add_to_corpus() {
+  local src="$1" mapped extracted
+  if is_rich_type "$src"; then
+    extracted="$(extract_rich "$src")" || return 0
+    mapped="$CORPUS_ROOT/${src#/}.qsearch.txt"
+    mkdir -p "$(dirname -- "$mapped")"
+    ln -sfn "$extracted" "$mapped"
+  else
+    mapped="$CORPUS_ROOT/${src#/}"
+    mkdir -p "$(dirname -- "$mapped")"
+    ln -sfn "$src" "$mapped"
+  fi
+  printf '%s\t%s\n' "$mapped" "$src" >> "$RUN_DIR/semantic-map.tsv"
+}
+
+refresh_semantic_corpus() {
+  CORPUS_ROOT="$CACHE_DIR/corpus"
+  EXTRACT_ROOT="$CACHE_DIR/extracted"
+  mkdir -p "$CORPUS_ROOT" "$EXTRACT_ROOT"
+  : > "$RUN_DIR/semantic-map.tsv"
+  : > "$RUN_DIR/semantic-targets.txt"
+  : > "$RUN_DIR/extraction.err"
+
+  local root mapped_root src mapped_file
+  for root in "${SEARCH_PATHS[@]}"; do
+    if [ -d "$root" ]; then
+      mapped_root="$CORPUS_ROOT/${root#/}"
+      rm -rf "$mapped_root"
+      mkdir -p "$mapped_root"
+      printf '%s\n' "$mapped_root" >> "$RUN_DIR/semantic-targets.txt"
+      while IFS= read -r -d '' src; do
+        add_to_corpus "$src"
+      done < <(rg --files --null --glob-case-insensitive "${GLOB_ARGS[@]}" "$root" 2>/dev/null)
+    elif [ -f "$root" ] && is_selected_type "$root"; then
+      if is_rich_type "$root"; then
+        mapped_file="$CORPUS_ROOT/${root#/}.qsearch.txt"
+      else
+        mapped_file="$CORPUS_ROOT/${root#/}"
+      fi
+      rm -f "$mapped_file"
+      add_to_corpus "$root"
+      [ -e "$mapped_file" ] && printf '%s\n' "$mapped_file" >> "$RUN_DIR/semantic-targets.txt"
+    fi
+  done
+
+  awk '!seen[$0]++' "$RUN_DIR/semantic-map.tsv" > "$RUN_DIR/semantic-map.tmp" && mv "$RUN_DIR/semantic-map.tmp" "$RUN_DIR/semantic-map.tsv"
+  awk 'NF && !seen[$0]++' "$RUN_DIR/semantic-targets.txt" > "$RUN_DIR/semantic-targets.tmp" && mv "$RUN_DIR/semantic-targets.tmp" "$RUN_DIR/semantic-targets.txt"
+}
+
+lookup_semantic_mapping() {
+  local line="$1"
+  awk -F '\t' -v line="$line" '
+    index(line, $1 ":") == 1 && length($1) > best {
+      best = length($1); mapped = $1; original = $2
+    }
+    END { if (best) printf "%s\t%s\n", mapped, original }
+  ' "$RUN_DIR/semantic-map.tsv"
+}
+
+run_semantic_stage() {
+  : > "$RUN_DIR/03-semantic.raw.txt"
+  : > "$RUN_DIR/03-semantic.txt"
+  : > "$RUN_DIR/03-semantic-scores.tsv"
+
+  if ! command_exists clawgrep; then
+    printf 'SKIPPED: clawgrep is not installed.\n' > "$RUN_DIR/03-semantic.txt"
+    warn "semantic stage requested but 'clawgrep' is not installed"
+    return 0
+  fi
+
+  if [ "$LANGUAGE" = "de" ]; then
+    warn "clawgrep currently uses an English BGE embedding model; German semantic ranking may be weaker than English"
+  fi
+
+  refresh_semantic_corpus
+
+  local targets=() t target_count only_target only_orig
+  while IFS= read -r t; do
+    [ -n "$t" ] && targets+=("$t")
+  done < "$RUN_DIR/semantic-targets.txt"
+  target_count="${#targets[@]}"
+
+  if [ "$target_count" -eq 0 ]; then
+    printf 'SKIPPED: no semantic-searchable files in scope.\n' > "$RUN_DIR/03-semantic.txt"
+    return 0
+  fi
+
+  clawgrep --no-color --show-score --cache-dir "$CACHE_DIR/clawgrep" -k "$TOP_K" "$QUERY" "${targets[@]}" \
+    > "$RUN_DIR/03-semantic.raw.txt" 2> "$RUN_DIR/03-semantic.err" || true
+
+  if [ "$target_count" -eq 1 ] && [ -f "${targets[0]}" ]; then
+    only_target="${targets[0]}"
+    only_orig="$(awk -F '\t' -v p="$only_target" '$1 == p {print $2; exit}' "$RUN_DIR/semantic-map.tsv")"
+  else
+    only_target=""
+    only_orig=""
+  fi
+
+  local line mapping mapped original remainder score
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    mapping="$(lookup_semantic_mapping "$line")"
+    if [ -n "$mapping" ]; then
+      mapped="${mapping%%$'\t'*}"
+      original="${mapping#*$'\t'}"
+      remainder="${line#"$mapped:"}"
+    elif [ -n "$only_target" ]; then
+      mapped="$only_target"
+      original="$only_orig"
+      remainder="$line"
+    else
+      printf '%s\n' "$line" >> "$RUN_DIR/03-semantic.txt"
+      continue
+    fi
+
+    printf '%s:%s\n' "$original" "$remainder" >> "$RUN_DIR/03-semantic.txt"
+    score="$(printf '%s\n' "$line" | sed -nE 's/.*\(([0-9]+([.][0-9]+)?)\)[[:space:]]*$/\1/p')"
+    [ -n "$score" ] && printf '%s\t%s\n' "$original" "$score" >> "$RUN_DIR/03-semantic-scores.tsv"
+  done < "$RUN_DIR/03-semantic.raw.txt"
+}
+
+combine_rankings() {
+  local combined="$RUN_DIR/ranking.data.tsv"
+  awk -F '\t' -v OFS='\t' '
+    FILENAME == ARGV[1] {
+      lex[$1] = $6 + 0
+      concepts[$1] = $2 + 0
+      total[$1] = $3 + 0
+      coverage[$1] = $4 + 0
+      exact[$1] = $5 + 0
+      files[$1] = 1
+      next
+    }
+    FILENAME == ARGV[2] {
+      s = $2 + 0
+      if (!( $1 in sem ) || s > sem[$1]) sem[$1] = s
+      files[$1] = 1
+      next
+    }
+    END {
+      for (f in files) {
+        l = lex[f] + 0
+        s = sem[f] + 0
+        if (s > 0) blended = 0.65 * s + 0.35 * l
+        else blended = l
+        final = blended > l ? blended : l
+        source = (l > 0 && s > 0) ? "lexical+semantic" : ((s > 0) ? "semantic" : "lexical")
+        printf "%.6f\t%.6f\t%.6f\t%d\t%d\t%.6f\t%d\t%s\t%s\n", final, l, s, concepts[f]+0, total[f]+0, coverage[f]+0, exact[f]+0, source, f
+      }
+    }
+  ' "$RUN_DIR/lexical-ranking.tsv" "$RUN_DIR/03-semantic-scores.tsv" \
+    | sort -t "$(printf '\t')" -k1,1nr > "$combined"
+
+  {
+    printf 'score\tlexical\tsemantic\tconcepts\ttotal\tcoverage\texact\tsource\tfile\n'
+    cat "$combined"
+  } > "$RUN_DIR/ranking.tsv"
+
+  BEST_FILE="$(awk -F '\t' 'NR==1 {print $9; exit}' "$combined")"
+  BEST_SCORE="$(awk -F '\t' 'NR==1 {print $1; exit}' "$combined")"
+  BEST_SOURCE="$(awk -F '\t' 'NR==1 {print $8; exit}' "$combined")"
+
+  {
+    printf 'Query: %s\n' "$QUERY"
+    printf 'Language: %s\n' "$LANGUAGE"
+    printf 'Lexical confidence: %s\n' "$LEXICAL_CONFIDENCE"
+    printf 'Semantic stage: %s\n\n' "$SEMANTIC_STATUS"
+    if [ -n "$BEST_FILE" ]; then
+      printf 'Best match: %s\n' "$BEST_FILE"
+      printf 'Score: %s\n' "$BEST_SCORE"
+      printf 'Source: %s\n\n' "$BEST_SOURCE"
+      printf 'Top matches:\n'
+      awk -F '\t' 'NR <= 10 {printf "%2d. %.3f  [%s]  %s\n", NR, $1, $8, $9}' "$combined"
+    else
+      printf 'No matches found.\n'
+    fi
+    printf '\nRun directory: %s\n' "$RUN_DIR"
+  } > "$RUN_DIR/final.txt"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --types)
+      [ "$#" -ge 2 ] || die "--types requires a value"
+      TYPES="$(lower "$2" | tr -d ' ')"; shift 2 ;;
+    --lang)
+      [ "$#" -ge 2 ] || die "--lang requires a value"
+      LANGUAGE="$2"; shift 2 ;;
+    --linguistics)
+      [ "$#" -ge 2 ] || die "--linguistics requires a value"
+      LINGUISTICS="$2"; shift 2 ;;
+    --semantic)
+      [ "$#" -ge 2 ] || die "--semantic requires a value"
+      SEMANTIC_MODE="$2"; shift 2 ;;
+    --threshold)
+      [ "$#" -ge 2 ] || die "--threshold requires a value"
+      THRESHOLD="$2"; shift 2 ;;
+    --top)
+      [ "$#" -ge 2 ] || die "--top requires a value"
+      TOP_K="$2"; shift 2 ;;
+    --cache-dir)
+      [ "$#" -ge 2 ] || die "--cache-dir requires a value"
+      CACHE_DIR="$2"; shift 2 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    --)
+      shift
+      while [ "$#" -gt 0 ]; do
+        if [ -z "$QUERY" ]; then QUERY="$1"; else PATHS+=("$1"); fi
+        shift
+      done
+      ;;
+    -*) die "unknown option: $1" ;;
+    *)
+      if [ -z "$QUERY" ]; then QUERY="$1"; else PATHS+=("$1"); fi
+      shift ;;
+  esac
+done
+
+[ -n "$QUERY" ] || { usage >&2; exit 2; }
+[ "${#PATHS[@]}" -gt 0 ] || PATHS=(".")
+
+case "$LANGUAGE" in auto|en|de) ;; *) die "--lang must be auto, en, or de" ;; esac
+case "$LINGUISTICS" in snowball|las|none) ;; *) die "--linguistics must be snowball, las, or none" ;; esac
+case "$SEMANTIC_MODE" in auto|always|never) ;; *) die "--semantic must be auto, always, or never" ;; esac
+
+command_exists rg || die "'rg' (ripgrep) is required"
+command_exists rga || die "'rga' (ripgrep-all) is required"
+
+for p in "${PATHS[@]}"; do
+  cp="$(canonical_path "$p" 2>/dev/null || true)"
+  if [ -n "$cp" ]; then SEARCH_PATHS+=("$cp"); else warn "path does not exist, skipping: $p"; fi
+done
+[ "${#SEARCH_PATHS[@]}" -gt 0 ] || die "no valid search paths"
+
+mkdir -p "$CACHE_DIR/runs" "$CACHE_DIR/clawgrep" "$CACHE_DIR/corpus" "$CACHE_DIR/extracted"
+RUN_DIR="$CACHE_DIR/runs/$(date '+%Y%m%d-%H%M%S')-$$"
+mkdir -p "$RUN_DIR"
+
+if [ "$LANGUAGE" = "auto" ]; then
+  if [ "$LINGUISTICS" = "las" ] && command_exists las; then
+    LANGUAGE="$(detect_language_las "$QUERY")"
+  fi
+  case "$LANGUAGE" in en|de) ;; *) LANGUAGE="$(detect_language_fast "$QUERY")" ;; esac
+fi
+
+build_globs
+prepare_query
+run_exact_stage
+run_expanded_stage
+build_lexical_ranking
+
+if should_run_semantic; then
+  SEMANTIC_STATUS="ran"
+  run_semantic_stage
+else
+  SEMANTIC_STATUS="skipped (lexical confidence ${LEXICAL_CONFIDENCE} >= ${THRESHOLD})"
+  : > "$RUN_DIR/03-semantic-scores.tsv"
+  printf 'SKIPPED: lexical confidence %s >= threshold %s.\n' "$LEXICAL_CONFIDENCE" "$THRESHOLD" > "$RUN_DIR/03-semantic.txt"
+fi
+
+combine_rankings
+cat "$RUN_DIR/final.txt"
