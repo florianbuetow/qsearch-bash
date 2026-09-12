@@ -107,10 +107,14 @@ else
 fi
 
 for opt in pandoc pdftotext clawgrep; do
-  if have "$opt"; then
-    ok "$opt $(command -v "$opt")"
-  else
+  if ! have "$opt"; then
     warn "$opt is not installed; the stages that need it will be skipped"
+  elif [ "$opt" = "clawgrep" ] && ! clawgrep --version >/dev/null 2>&1; then
+    # Present but non-functional: usually a missing per-platform binary.
+    warn "clawgrep is on PATH but does not run; semantic search will produce nothing"
+    warn "  try: npm install -g @clawgrep/clawgrep-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+  else
+    ok "$opt $(command -v "$opt")"
   fi
 done
 

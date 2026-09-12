@@ -85,3 +85,20 @@ elif have pipx; then
 else
   warn "clawgrep is missing; install it with npm, cargo, or pipx for semantic search"
 fi
+
+# The clawgrep npm package is only a launcher - the real binary ships in a
+# per-platform package. Without it the command exists and exits cleanly while
+# producing nothing, so check that it actually runs.
+if have clawgrep && ! clawgrep --version >/dev/null 2>&1; then
+  case "$(uname -m)" in
+    arm64) plat="darwin-arm64" ;;
+    x86_64) plat="darwin-x64" ;;
+    *) plat="" ;;
+  esac
+  if [ -n "$plat" ] && have npm; then
+    info "installing clawgrep platform binary (@clawgrep/clawgrep-$plat)"
+    npm install -g "@clawgrep/clawgrep-$plat" || warn "could not install @clawgrep/clawgrep-$plat"
+  else
+    warn "clawgrep is installed but its platform binary for $(uname -m) is missing"
+  fi
+fi

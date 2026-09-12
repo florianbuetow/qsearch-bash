@@ -15,7 +15,7 @@ TYPES="$DEFAULT_TYPES"
 LANGUAGE="auto"
 LINGUISTICS="snowball"
 SEMANTIC_MODE="auto"
-THRESHOLD="0.75"
+THRESHOLD="0.35"
 TOP_K="20"
 CACHE_DIR="$DEFAULT_CACHE"
 QUERY=""
@@ -35,7 +35,9 @@ Options:
   --linguistics MODE       snowball|las|none. Default: snowball.
   --semantic MODE          auto|always|never. Default: auto.
   --threshold FLOAT        Lexical confidence needed to skip semantic search.
-                            Default: 0.75.
+                            Confidence is how much of the query's information
+                            the top hit covers, times its margin over the
+                            runner-up. Default: 0.35.
   --top N                  Semantic/final top results. Default: 20.
   --cache-dir PATH         Cache/run location.
   -h, --help               Show this help.
@@ -118,7 +120,15 @@ detect_language_fast() {
   local q="$1" de en
   de="$(printf '%s\n' "$q" | tr '[:upper:]' '[:lower:]' | grep -Eio '(^|[^[:alnum:]_])(der|die|das|und|ist|sind|nicht|mit|für|von|zu|wie|was|ich|wir|ein|eine|einer|einen|einem|eines|auf|bei|durch|werden|wurde|wurden|über)([^[:alnum:]_]|$)|[äöüß]' 2>/dev/null | wc -l | tr -d ' ')"
   en="$(printf '%s\n' "$q" | tr '[:upper:]' '[:lower:]' | grep -Eio '(^|[^[:alnum:]_])(the|and|is|are|not|with|for|from|to|how|what|this|that|of|in|on|by|was|were|be|been|does|do)([^[:alnum:]_]|$)' 2>/dev/null | wc -l | tr -d ' ')"
-  if [ "${de:-0}" -gt "${en:-0}" ]; then printf 'de\n'; else printf 'en\n'; fi
+  if [ "${de:-0}" -gt "${en:-0}" ]; then
+    printf 'de\n'
+  elif [ "${en:-0}" -gt "${de:-0}" ]; then
+    printf 'en\n'
+  else
+    # No function words either way - typically a query of bare nouns, where
+    # guessing costs recall. Treat it as both languages instead.
+    printf 'mixed\n'
+  fi
 }
 
 detect_language_las() {
@@ -134,11 +144,32 @@ stopword_file() {
   esac
 }
 
+# Stopword lists that apply to this query. "mixed" means the detector could
+# not tell, so both are used rather than guessing.
+stopword_languages() {
+  case "$LANGUAGE" in
+    mixed) printf 'de en\n' ;;
+    *) printf '%s\n' "$LANGUAGE" ;;
+  esac
+}
+
+# Single language code for tools that take exactly one (stemwords, las).
+primary_language() {
+  case "$LANGUAGE" in
+    mixed) printf 'de\n' ;;
+    *) printf '%s\n' "$LANGUAGE" ;;
+  esac
+}
+
 filter_stopwords() {
-  local input="$1" output="$2" sw
-  sw="$(stopword_file "$LANGUAGE")"
-  if [ -f "$sw" ]; then
-    grep -Fivx -f "$sw" "$input" 2>/dev/null | awk 'NF' > "$output" || true
+  local input="$1" output="$2" lang sw
+  local args=()
+  for lang in $(stopword_languages); do
+    sw="$(stopword_file "$lang")"
+    [ -f "$sw" ] && args+=(-f "$sw")
+  done
+  if [ "${#args[@]}" -gt 0 ]; then
+    grep -Fivx "${args[@]}" "$input" 2>/dev/null | awk 'NF' > "$output" || true
   else
     cp "$input" "$output"
   fi
@@ -159,7 +190,7 @@ prepare_query() {
 
   if [ "$LINGUISTICS" = "las" ]; then
     command_exists las || die "--linguistics las requested, but 'las' is not installed"
-    las lemmatize --locale "$LANGUAGE" --process-by line < "$filtered" 2>"$RUN_DIR/las.err" \
+    las lemmatize --locale "$(primary_language)" --process-by line < "$filtered" 2>"$RUN_DIR/las.err" \
       | tokenize > "$lemmas" || true
     if [ "$(wc -l < "$lemmas" | tr -d ' ')" != "$(wc -l < "$filtered" | tr -d ' ')" ]; then
       warn "LAS output did not align one-to-one with query tokens; using original tokens for expansion"
@@ -170,7 +201,7 @@ prepare_query() {
   fi
 
   if [ "$LINGUISTICS" != "none" ] && command_exists stemwords; then
-    stemwords -l "$LANGUAGE" < "$lemmas" > "$stems" 2>"$RUN_DIR/snowball.err" || cp "$lemmas" "$stems"
+    stemwords -l "$(primary_language)" < "$lemmas" > "$stems" 2>"$RUN_DIR/snowball.err" || cp "$lemmas" "$stems"
   else
     if [ "$LINGUISTICS" = "snowball" ] && ! command_exists stemwords; then
       warn "'stemwords' is not installed; continuing without stemming"
@@ -228,6 +259,29 @@ run_rga() {
   rga --glob-case-insensitive "$@"
 }
 
+# rga --count-matches prints "path:count". Paths may contain colons, so split
+# on the last one only.
+split_count_line() {
+  sed -E 's/:([0-9]+)$/\t\1/' "$1"
+}
+
+# Word count per file, used to normalize scores by document length. Without it
+# a long document matches every term and wins every query.
+measure_doc_lengths() {
+  local out="$1"
+  local candidates="$RUN_DIR/candidate-files.txt"
+
+  awk -F '\t' '$1 == "C" { print $3 } $1 == "E" { print $2 }' "$RUN_DIR/lexical-events.tsv" \
+    | awk 'NF && !seen[$0]++' > "$candidates"
+
+  : > "$out"
+  [ -s "$candidates" ] || return 0
+
+  tr '\n' '\0' < "$candidates" \
+    | xargs -0 -n 32 rga -H --count-matches --color never -e '\p{L}+' 2>> "$RUN_DIR/doc-lengths.err" \
+    | sed -E 's/:([0-9]+)$/\t\1/' >> "$out" || true
+}
+
 run_exact_stage() {
   : > "$RUN_DIR/01-exact.txt"
   : > "$RUN_DIR/01-exact-files.txt"
@@ -248,12 +302,17 @@ run_expanded_stage() {
     if [ -z "$combined" ]; then combined="$pattern"; else combined="${combined}|${pattern}"; fi
 
     safe_name="$(printf '%03d-%s' "$idx" "$original" | tr '/[:space:]' '__')"
-    run_rga -l --color never -i "${GLOB_ARGS[@]}" -e "$pattern" "${SEARCH_PATHS[@]}" \
-      > "$RUN_DIR/02-concepts/${safe_name}.files.txt" 2>> "$RUN_DIR/02-expanded.err" || true
+    # --count-matches gives the term frequency per file, which the ranking
+    # needs; -H keeps the filename even when a single file is searched.
+    run_rga -H --count-matches --color never -i "${GLOB_ARGS[@]}" -e "$pattern" "${SEARCH_PATHS[@]}" \
+      > "$RUN_DIR/02-concepts/${safe_name}.counts.txt" 2>> "$RUN_DIR/02-expanded.err" || true
 
-    while IFS= read -r file; do
-      [ -n "$file" ] && printf 'C\t%s\t%s\n' "$idx" "$file" >> "$RUN_DIR/02-concept-files.tsv"
-    done < "$RUN_DIR/02-concepts/${safe_name}.files.txt"
+    split_count_line "$RUN_DIR/02-concepts/${safe_name}.counts.txt" \
+      | awk -F '\t' -v idx="$idx" 'NF == 2 { printf "C\t%s\t%s\t%s\n", idx, $1, $2 }' \
+      >> "$RUN_DIR/02-concept-files.tsv"
+
+    split_count_line "$RUN_DIR/02-concepts/${safe_name}.counts.txt" \
+      | cut -f1 > "$RUN_DIR/02-concepts/${safe_name}.files.txt"
   done < "$RUN_DIR/query-regexes.tsv"
 
   run_rga -n --no-heading --color never -i "${GLOB_ARGS[@]}" -e "$combined" "${SEARCH_PATHS[@]}" \
@@ -268,7 +327,12 @@ build_lexical_ranking() {
   done < "$RUN_DIR/01-exact-files.txt"
   cat "$RUN_DIR/02-concept-files.tsv" >> "$stream"
 
-  awk -F '\t' -v OFS='\t' -v total="$CONCEPT_COUNT" '
+  measure_doc_lengths "$RUN_DIR/doc-lengths.tsv"
+
+  # BM25: rare query terms outweigh common ones, and a term found in a short
+  # recipe counts for more than the same term buried in a whole cookbook.
+  awk -F '\t' -v OFS='\t' -v total="$CONCEPT_COUNT" -v k1=1.2 -v b=0.75 '
+    NR == FNR { len[$1] = $2 + 0; next }
     $1 == "E" {
       exact[$2] = 1
       files[$2] = 1
@@ -276,28 +340,81 @@ build_lexical_ranking() {
     }
     $1 == "C" {
       key = $2 SUBSEP $3
-      if (!seen[key]++) count[$3]++
+      if (!seen[key]++) {
+        df[$2]++
+        tf[key] = $4 + 0
+        concepts[$3] = concepts[$3] " " $2
+        count[$3]++
+      }
       files[$3] = 1
     }
     END {
+      n = 0
+      sum = 0
+      measured = 0
+      for (f in files) {
+        n++
+        if (f in len) { sum += len[f]; measured++ }
+      }
+      if (n == 0) exit
+      avgdl = measured > 0 ? sum / measured : 1
+      if (avgdl <= 0) avgdl = 1
+
+      total_idf = 0
+      for (c = 1; c <= total; c++) {
+        d = df[c] + 0
+        idf[c] = log(1 + (n - d + 0.5) / (d + 0.5))
+        total_idf += idf[c]
+      }
+      if (total_idf <= 0) total_idf = 1
+
+      best = 0
+      for (f in files) {
+        dl = (f in len) ? len[f] : avgdl
+        if (dl <= 0) dl = avgdl
+        bm = 0
+        mass = 0
+        m = split(concepts[f], list, " ")
+        for (i = 1; i <= m; i++) {
+          if (list[i] == "") continue
+          ci = list[i] + 0
+          t = tf[ci SUBSEP f] + 0
+          if (t < 1) t = 1
+          bm += idf[ci] * (t * (k1 + 1)) / (t + k1 * (1 - b + b * dl / avgdl))
+          mass += idf[ci]
+        }
+        if (exact[f]) bm *= 1.25
+        raw[f] = bm
+        docl[f] = dl
+        idfcov[f] = mass / total_idf
+        if (bm > best) best = bm
+      }
+      if (best <= 0) best = 1
+
       for (f in files) {
         c = count[f] + 0
         coverage = total > 0 ? c / total : 0
-        e = exact[f] ? 1 : 0
-        score = coverage + (e ? 0.25 : 0)
-        if (score > 1) score = 1
-        printf "%s\t%d\t%d\t%.6f\t%d\t%.6f\n", f, c, total, coverage, e, score
+        printf "%s\t%d\t%d\t%.6f\t%d\t%.6f\t%.6f\t%d\n", \
+          f, c, total, coverage, (exact[f] ? 1 : 0), raw[f] / best, idfcov[f], docl[f]
       }
     }
-  ' "$stream" | sort -t "$(printf '\t')" -k6,6nr -k4,4nr > "$RUN_DIR/lexical-ranking.tsv"
+  ' "$RUN_DIR/doc-lengths.tsv" "$stream" \
+    | sort -t "$(printf '\t')" -k6,6nr -k7,7nr > "$RUN_DIR/lexical-ranking.tsv"
 
-  LEXICAL_CONFIDENCE="$(awk -F '\t' 'NR==1 {print $6; exit}' "$RUN_DIR/lexical-ranking.tsv")"
+  # Confidence is about discrimination, not about the top score: how much of
+  # the query's information content the winner actually covers, times how far
+  # clear of the runner-up it is. A near-tie means the lexical stages did not
+  # decide anything, which is exactly when the semantic stage should run.
+  LEXICAL_CONFIDENCE="$(awk -F '\t' '
+    NR == 1 { top = $6 + 0; cov = $7 + 0; next }
+    NR == 2 { second = $6 + 0 }
+    END {
+      if (NR == 0 || top <= 0) { print "0"; exit }
+      margin = (top - second) / top
+      printf "%.6f\n", cov * margin
+    }
+  ' "$RUN_DIR/lexical-ranking.tsv")"
   [ -n "$LEXICAL_CONFIDENCE" ] || LEXICAL_CONFIDENCE="0"
-  if [ "$CONCEPT_COUNT" -eq 1 ] && [ "$LEXICAL_CONFIDENCE" != "0" ]; then
-    if [ ! -s "$RUN_DIR/01-exact-files.txt" ]; then
-      LEXICAL_CONFIDENCE="0.50"
-    fi
-  fi
 }
 
 should_run_semantic() {
@@ -417,6 +534,7 @@ run_semantic_stage() {
   : > "$RUN_DIR/03-semantic-scores.tsv"
 
   if ! command_exists clawgrep; then
+    SEMANTIC_FAILED=1
     printf 'SKIPPED: clawgrep is not installed.\n' > "$RUN_DIR/03-semantic.txt"
     warn "semantic stage requested but 'clawgrep' is not installed"
     return 0
@@ -435,12 +553,28 @@ run_semantic_stage() {
   target_count="${#targets[@]}"
 
   if [ "$target_count" -eq 0 ]; then
+    SEMANTIC_FAILED=1
     printf 'SKIPPED: no semantic-searchable files in scope.\n' > "$RUN_DIR/03-semantic.txt"
     return 0
   fi
 
   clawgrep --no-color --show-score --cache-dir "$CACHE_DIR/clawgrep" -k "$TOP_K" "$QUERY" "${targets[@]}" \
     > "$RUN_DIR/03-semantic.raw.txt" 2> "$RUN_DIR/03-semantic.err" || true
+
+  # clawgrep can exit cleanly while still having produced nothing (a missing
+  # platform binary does exactly that). Do not report a stage as having run
+  # when it contributed no scores.
+  if [ ! -s "$RUN_DIR/03-semantic.raw.txt" ]; then
+    SEMANTIC_FAILED=1
+    if [ -s "$RUN_DIR/03-semantic.err" ]; then
+      warn "semantic stage produced no results: $(head -n 1 "$RUN_DIR/03-semantic.err")"
+      cp "$RUN_DIR/03-semantic.err" "$RUN_DIR/03-semantic.txt"
+    else
+      warn "semantic stage produced no results"
+      printf 'FAILED: clawgrep returned no output.\n' > "$RUN_DIR/03-semantic.txt"
+    fi
+    return 0
+  fi
 
   if [ "$target_count" -eq 1 ] && [ -f "${targets[0]}" ]; then
     only_target="${targets[0]}"
@@ -605,12 +739,22 @@ run_expanded_stage
 build_lexical_ranking
 
 if should_run_semantic; then
-  SEMANTIC_STATUS="ran"
+  SEMANTIC_FAILED=0
   run_semantic_stage
+  if [ "$SEMANTIC_FAILED" -eq 1 ]; then
+    SEMANTIC_STATUS="no results (see 03-semantic.txt)"
+  else
+    SEMANTIC_STATUS="ran"
+  fi
 else
-  SEMANTIC_STATUS="skipped (lexical confidence ${LEXICAL_CONFIDENCE} >= ${THRESHOLD})"
+  if [ "$SEMANTIC_MODE" = "never" ]; then
+    SEMANTIC_REASON="--semantic never"
+  else
+    SEMANTIC_REASON="lexical confidence ${LEXICAL_CONFIDENCE} >= threshold ${THRESHOLD}"
+  fi
+  SEMANTIC_STATUS="skipped (${SEMANTIC_REASON})"
   : > "$RUN_DIR/03-semantic-scores.tsv"
-  printf 'SKIPPED: lexical confidence %s >= threshold %s.\n' "$LEXICAL_CONFIDENCE" "$THRESHOLD" > "$RUN_DIR/03-semantic.txt"
+  printf 'SKIPPED: %s.\n' "$SEMANTIC_REASON" > "$RUN_DIR/03-semantic.txt"
 fi
 
 combine_rankings

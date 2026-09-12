@@ -10,6 +10,18 @@
 
 Each run keeps every stage so the retrieval process remains inspectable.
 
+## Ranking
+
+Files are ranked with BM25. Rare query terms count for much more than common
+ones, and a term found in a short recipe counts for more than the same term
+buried in a whole cookbook. Without both of those, a long document matches
+every term of a natural-language question and wins every query.
+
+The confidence that gates the semantic stage measures *discrimination*, not the
+top score: how much of the query's information content the winner covers, times
+its margin over the runner-up. A near-tie scores near zero, which is exactly
+when the semantic fallback should run. Default threshold: `0.35`.
+
 ## Install
 
 Two commands. Clone the repository into `~/scripts/qsearch`, then run its installer:
